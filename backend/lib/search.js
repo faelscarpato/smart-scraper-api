@@ -25,33 +25,30 @@ function normalizeUrl(href) {
  * @param {{ limit?: number, region?: string, timeoutMs?: number }} [options]
  * @returns {Promise<Array<{url:string,title:string,snippet:string,position:number}>>}
  */
-export async function search(query, options = {}) {
-  const { limit = 10, region = "br-pt", timeoutMs = 15000 } = options;
+async function fetchHtml(url, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let html;
   try {
-    const res = await fetch("https://html.duckduckgo.com/html/", {
-      method: "POST",
+    const res = await fetch(url, {
       signal: controller.signal,
       headers: {
         "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "text/html,application/xhtml+xml",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
       },
-      body: new URLSearchParams({ q: query, kl: region }).toString(),
     });
-    if (!res.ok) throw new Error(`DuckDuckGo respondeu ${res.status}`);
-    html = await res.text();
+    if (!res.ok) throw new Error(`Buscador respondeu ${res.status}`);
+    return await res.text();
   } finally {
     clearTimeout(timer);
   }
+}
 
+/** Parser do endpoint /html/ (cards .result). */
+function parseHtmlEndpoint(html) {
   const $ = cheerio.load(html);
   const results = [];
   const seen = new Set();
-
   $(".result, .web-result").each((_, el) => {
     const node = $(el);
     const url = normalizeUrl(node.find("a.result__a").attr("href"));
@@ -64,6 +61,48 @@ export async function search(query, options = {}) {
       position: results.length + 1,
     });
   });
+  return results;
+}
 
-  return results.slice(0, limit);
+/** Parser do endpoint /lite/ (tabela com a.result-link). */
+function parseLiteEndpoint(html) {
+  const $ = cheerio.load(html);
+  const results = [];
+  const seen = new Set();
+  $("a.result-link").each((_, el) => {
+    const node = $(el);
+    const url = normalizeUrl(node.attr("href"));
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    const snippet = node
+      .closest("tr")
+      .next("tr")
+      .find(".result-snippet")
+      .text()
+      .replace(/\s+/g, " ")
+      .trim();
+    results.push({ url, title: node.text().trim(), snippet, position: results.length + 1 });
+  });
+  return results;
+}
+
+export async function search(query, options = {}) {
+  const { limit = 10, region = "br-pt", timeoutMs = 15000 } = options;
+  const params = new URLSearchParams({ q: query, kl: region });
+  const sources = [
+    { url: `https://html.duckduckgo.com/html/?${params}`, parse: parseHtmlEndpoint },
+    { url: `https://lite.duckduckgo.com/lite/?${params}`, parse: parseLiteEndpoint },
+  ];
+
+  let lastError = null;
+  for (const source of sources) {
+    try {
+      const results = source.parse(await fetchHtml(source.url, timeoutMs));
+      if (results.length) return results.slice(0, limit);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (lastError) throw lastError;
+  return [];
 }
